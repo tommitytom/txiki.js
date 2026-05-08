@@ -33,6 +33,10 @@
 #include <string.h>
 #include <uv.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Borrowed from Folly */
 #ifndef TJS_PRINTF_FORMAT
 #ifdef _MSC_VER
@@ -175,5 +179,9 @@ int tjs_getsignum(const char *sig_str);
     if (!(check)) {                                                                                                    \
         return TJS_THROW_ARG_ERR(ctx, argno, expected);                                                                \
     }
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
 
 #endif

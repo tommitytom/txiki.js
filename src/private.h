@@ -57,6 +57,10 @@
 #define strcasecmp  _stricmp
 #endif
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct TJSTimer TJSTimer;
 
 typedef struct {
@@ -194,5 +198,9 @@ JSValue TJS_EvalModuleContent(JSContext *ctx,
                               bool use_realpath,
                               const char *content,
                               size_t len);
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
 
 #endif

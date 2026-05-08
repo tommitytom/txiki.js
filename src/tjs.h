@@ -28,6 +28,10 @@
 
 #include <quickjs.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct TJSRuntime TJSRuntime;
 
 typedef struct TJSRunOptions {
@@ -44,5 +48,9 @@ JSContext *TJS_GetJSContext(TJSRuntime *qrt);
 TJSRuntime *TJS_GetRuntime(JSContext *ctx);
 int TJS_Run(TJSRuntime *qrt);
 void TJS_Stop(TJSRuntime *qrt);
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
 
 #endif
