@@ -11,20 +11,20 @@ function getRandomValues(obj) {
     switch (type) {
         case 'Int8Array':
         case 'Uint8Array':
+        case 'Uint8ClampedArray':
         case 'Int16Array':
         case 'Uint16Array':
         case 'Int32Array':
         case 'Uint32Array':
+        case 'BigInt64Array':
+        case 'BigUint64Array':
             break;
         default:
             throw new TypeError('Argument 1 of Crypto.getRandomValues does not implement interface ArrayBufferView');
     }
 
     if (obj.byteLength > 65536) {
-        const e = new Error();
-
-        e.name = 'QuotaExceededError';
-        throw e;
+        throw new DOMException('The requested length exceeds 65536 bytes', 'QuotaExceededError');
     }
 
     core.random(obj.buffer, obj.byteOffset, obj.byteLength);

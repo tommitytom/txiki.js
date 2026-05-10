@@ -25,13 +25,12 @@
 #include "ed25519.h"
 #include "mem.h"
 #include "private.h"
+#include "utils.h"
 
 #include <mbedtls/cipher.h>
-#include <mbedtls/ctr_drbg.h>
 #include <mbedtls/ecdh.h>
 #include <mbedtls/ecdsa.h>
 #include <mbedtls/ecp.h>
-#include <mbedtls/entropy.h>
 #include <mbedtls/hkdf.h>
 #include <mbedtls/md.h>
 #include <mbedtls/nist_kw.h>
@@ -967,12 +966,6 @@ static const mbedtls_ecp_group_id curve_to_group_id[] = {
 static const int curve_byte_sizes[] = { 32, 48, 66 };
 /* clang-format on */
 
-static int tjs__setup_rng(mbedtls_ctr_drbg_context *ctr_drbg, mbedtls_entropy_context *entropy) {
-    mbedtls_ctr_drbg_init(ctr_drbg);
-    mbedtls_entropy_init(entropy);
-    return mbedtls_ctr_drbg_seed(ctr_drbg, mbedtls_entropy_func, entropy, NULL, 0);
-}
-
 /* EC key generation (shared by ECDSA and ECDH). */
 
 typedef struct {
@@ -990,17 +983,10 @@ typedef struct {
 static void tjs__ec_generate_key_work_cb(uv_work_t *req) {
     TJSEcGenerateKeyReq *er = req->data;
     mbedtls_ecdsa_context ecdsa;
-    mbedtls_ctr_drbg_context ctr_drbg;
-    mbedtls_entropy_context entropy;
 
     mbedtls_ecdsa_init(&ecdsa);
 
-    int ret = tjs__setup_rng(&ctr_drbg, &entropy);
-    if (ret != 0) {
-        goto cleanup;
-    }
-
-    ret = mbedtls_ecdsa_genkey(&ecdsa, curve_to_group_id[er->curve], mbedtls_ctr_drbg_random, &ctr_drbg);
+    int ret = mbedtls_ecdsa_genkey(&ecdsa, curve_to_group_id[er->curve], tjs__entropy_uv, NULL);
     if (ret != 0) {
         goto cleanup;
     }
@@ -1020,8 +1006,6 @@ static void tjs__ec_generate_key_work_cb(uv_work_t *req) {
 
 cleanup:
     mbedtls_ecdsa_free(&ecdsa);
-    mbedtls_ctr_drbg_free(&ctr_drbg);
-    mbedtls_entropy_free(&entropy);
     er->r = ret;
 }
 
@@ -1132,8 +1116,6 @@ static void tjs__ecdsa_sign_work_cb(uv_work_t *req) {
     TJSEcdsaSignReq *sr = req->data;
     mbedtls_ecp_group grp;
     mbedtls_mpi d, r_mpi, s_mpi;
-    mbedtls_ctr_drbg_context ctr_drbg;
-    mbedtls_entropy_context entropy;
     uint8_t hash[64]; /* Max SHA-512. */
 
     mbedtls_ecp_group_init(&grp);
@@ -1141,21 +1123,16 @@ static void tjs__ecdsa_sign_work_cb(uv_work_t *req) {
     mbedtls_mpi_init(&r_mpi);
     mbedtls_mpi_init(&s_mpi);
 
-    int ret = tjs__setup_rng(&ctr_drbg, &entropy);
-    if (ret != 0) {
-        goto cleanup;
-    }
-
     /* Hash the data. */
     mbedtls_md_type_t md_type = digest_to_md_type[sr->hash_type];
     const mbedtls_md_info_t *md_info = mbedtls_md_info_from_type(md_type);
     if (!md_info) {
-        ret = -1;
-        goto cleanup;
+        sr->r = -1;
+        return;
     }
 
     size_t hash_len = mbedtls_md_get_size(md_info);
-    ret = mbedtls_md(md_info, sr->data_ref.data, sr->data_ref.size, hash);
+    int ret = mbedtls_md(md_info, sr->data_ref.data, sr->data_ref.size, hash);
     if (ret != 0) {
         goto cleanup;
     }
@@ -1172,15 +1149,7 @@ static void tjs__ecdsa_sign_work_cb(uv_work_t *req) {
     }
 
     /* Deterministic ECDSA sign. */
-    ret = mbedtls_ecdsa_sign_det_ext(&grp,
-                                     &r_mpi,
-                                     &s_mpi,
-                                     &d,
-                                     hash,
-                                     hash_len,
-                                     md_type,
-                                     mbedtls_ctr_drbg_random,
-                                     &ctr_drbg);
+    ret = mbedtls_ecdsa_sign_det_ext(&grp, &r_mpi, &s_mpi, &d, hash, hash_len, md_type, tjs__entropy_uv, NULL);
     if (ret != 0) {
         goto cleanup;
     }
@@ -1198,8 +1167,6 @@ cleanup:
     mbedtls_mpi_free(&r_mpi);
     mbedtls_mpi_free(&d);
     mbedtls_ecp_group_free(&grp);
-    mbedtls_ctr_drbg_free(&ctr_drbg);
-    mbedtls_entropy_free(&entropy);
     sr->r = ret;
 }
 
@@ -1458,6 +1425,11 @@ static JSValue tjs_webcrypto_ecdsa_verify(JSContext *ctx, JSValue this_val, int 
         goto fail;
     }
 
+    if (vr->sig_ref.size < (size_t) (2 * curve_byte_sizes[vr->curve])) {
+        JS_ThrowTypeError(ctx, "signature too short for curve");
+        goto fail;
+    }
+
     if (tjs_buf_ref_get(ctx, argv[4], &vr->data_ref) != 0) {
         goto fail;
     }
@@ -1499,20 +1471,13 @@ static void tjs__ecdh_derive_bits_work_cb(uv_work_t *req) {
     mbedtls_ecp_group grp;
     mbedtls_mpi d, z;
     mbedtls_ecp_point Q;
-    mbedtls_ctr_drbg_context ctr_drbg;
-    mbedtls_entropy_context entropy;
 
     mbedtls_ecp_group_init(&grp);
     mbedtls_mpi_init(&d);
     mbedtls_mpi_init(&z);
     mbedtls_ecp_point_init(&Q);
 
-    int ret = tjs__setup_rng(&ctr_drbg, &entropy);
-    if (ret != 0) {
-        goto cleanup;
-    }
-
-    ret = mbedtls_ecp_group_load(&grp, curve_to_group_id[dr->curve]);
+    int ret = mbedtls_ecp_group_load(&grp, curve_to_group_id[dr->curve]);
     if (ret != 0) {
         goto cleanup;
     }
@@ -1527,7 +1492,7 @@ static void tjs__ecdh_derive_bits_work_cb(uv_work_t *req) {
         goto cleanup;
     }
 
-    ret = mbedtls_ecdh_compute_shared(&grp, &z, &Q, &d, mbedtls_ctr_drbg_random, &ctr_drbg);
+    ret = mbedtls_ecdh_compute_shared(&grp, &z, &Q, &d, tjs__entropy_uv, NULL);
     if (ret != 0) {
         goto cleanup;
     }
@@ -1539,8 +1504,6 @@ cleanup:
     mbedtls_mpi_free(&z);
     mbedtls_mpi_free(&d);
     mbedtls_ecp_group_free(&grp);
-    mbedtls_ctr_drbg_free(&ctr_drbg);
-    mbedtls_entropy_free(&entropy);
     dr->r = ret;
 }
 
@@ -1655,22 +1618,15 @@ typedef struct {
 static void tjs__rsa_generate_key_work_cb(uv_work_t *req) {
     TJSRsaGenerateKeyReq *rr = req->data;
     mbedtls_pk_context pk;
-    mbedtls_ctr_drbg_context ctr_drbg;
-    mbedtls_entropy_context entropy;
 
     mbedtls_pk_init(&pk);
 
-    int ret = tjs__setup_rng(&ctr_drbg, &entropy);
+    int ret = mbedtls_pk_setup(&pk, mbedtls_pk_info_from_type(MBEDTLS_PK_RSA));
     if (ret != 0) {
         goto cleanup;
     }
 
-    ret = mbedtls_pk_setup(&pk, mbedtls_pk_info_from_type(MBEDTLS_PK_RSA));
-    if (ret != 0) {
-        goto cleanup;
-    }
-
-    ret = mbedtls_rsa_gen_key(mbedtls_pk_rsa(pk), mbedtls_ctr_drbg_random, &ctr_drbg, rr->modulus_length, rr->exponent);
+    ret = mbedtls_rsa_gen_key(mbedtls_pk_rsa(pk), tjs__entropy_uv, NULL, rr->modulus_length, rr->exponent);
     if (ret != 0) {
         goto cleanup;
     }
@@ -1731,8 +1687,6 @@ static void tjs__rsa_generate_key_work_cb(uv_work_t *req) {
 
 cleanup:
     mbedtls_pk_free(&pk);
-    mbedtls_ctr_drbg_free(&ctr_drbg);
-    mbedtls_entropy_free(&entropy);
     rr->r = ret;
 }
 
@@ -1781,7 +1735,11 @@ static JSValue tjs_webcrypto_rsa_generate_key(JSContext *ctx, JSValue this_val, 
         return JS_EXCEPTION;
     }
 
-    int exponent = 0;
+    if (exp_len > 4) {
+        return JS_ThrowTypeError(ctx, "RSA public exponent must be at most 4 bytes");
+    }
+
+    uint32_t exponent = 0;
     for (size_t i = 0; i < exp_len; i++) {
         exponent = (exponent << 8) | exp_buf[i];
     }
@@ -1833,17 +1791,10 @@ typedef struct {
 static void tjs__rsa_oaep_encrypt_work_cb(uv_work_t *req) {
     TJSRsaOaepEncryptReq *er = req->data;
     mbedtls_pk_context pk;
-    mbedtls_ctr_drbg_context ctr_drbg;
-    mbedtls_entropy_context entropy;
 
     mbedtls_pk_init(&pk);
 
-    int ret = tjs__setup_rng(&ctr_drbg, &entropy);
-    if (ret != 0) {
-        goto cleanup;
-    }
-
-    ret = mbedtls_pk_parse_public_key(&pk, er->pubkey_der_ref.data, er->pubkey_der_ref.size);
+    int ret = mbedtls_pk_parse_public_key(&pk, er->pubkey_der_ref.data, er->pubkey_der_ref.size);
     if (ret != 0) {
         goto cleanup;
     }
@@ -1859,8 +1810,8 @@ static void tjs__rsa_oaep_encrypt_work_cb(uv_work_t *req) {
     }
 
     ret = mbedtls_rsa_rsaes_oaep_encrypt(rsa,
-                                         mbedtls_ctr_drbg_random,
-                                         &ctr_drbg,
+                                         tjs__entropy_uv,
+                                         NULL,
                                          er->label_ref.data,
                                          er->label_ref.size,
                                          er->data_ref.size,
@@ -1869,8 +1820,6 @@ static void tjs__rsa_oaep_encrypt_work_cb(uv_work_t *req) {
 
 cleanup:
     mbedtls_pk_free(&pk);
-    mbedtls_ctr_drbg_free(&ctr_drbg);
-    mbedtls_entropy_free(&entropy);
     er->r = ret;
 }
 
@@ -1986,23 +1935,11 @@ typedef struct {
 static void tjs__rsa_oaep_decrypt_work_cb(uv_work_t *req) {
     TJSRsaOaepDecryptReq *dr = req->data;
     mbedtls_pk_context pk;
-    mbedtls_ctr_drbg_context ctr_drbg;
-    mbedtls_entropy_context entropy;
 
     mbedtls_pk_init(&pk);
 
-    int ret = tjs__setup_rng(&ctr_drbg, &entropy);
-    if (ret != 0) {
-        goto cleanup;
-    }
-
-    ret = mbedtls_pk_parse_key(&pk,
-                               dr->privkey_der_ref.data,
-                               dr->privkey_der_ref.size,
-                               NULL,
-                               0,
-                               mbedtls_ctr_drbg_random,
-                               &ctr_drbg);
+    int ret =
+        mbedtls_pk_parse_key(&pk, dr->privkey_der_ref.data, dr->privkey_der_ref.size, NULL, 0, tjs__entropy_uv, NULL);
     if (ret != 0) {
         goto cleanup;
     }
@@ -2018,8 +1955,8 @@ static void tjs__rsa_oaep_decrypt_work_cb(uv_work_t *req) {
     }
 
     ret = mbedtls_rsa_rsaes_oaep_decrypt(rsa,
-                                         mbedtls_ctr_drbg_random,
-                                         &ctr_drbg,
+                                         tjs__entropy_uv,
+                                         NULL,
                                          dr->label_ref.data,
                                          dr->label_ref.size,
                                          &dr->output_len,
@@ -2029,8 +1966,6 @@ static void tjs__rsa_oaep_decrypt_work_cb(uv_work_t *req) {
 
 cleanup:
     mbedtls_pk_free(&pk);
-    mbedtls_ctr_drbg_free(&ctr_drbg);
-    mbedtls_entropy_free(&entropy);
     dr->r = ret;
 }
 
@@ -2146,24 +2081,12 @@ typedef struct {
 static void tjs__rsa_sign_work_cb(uv_work_t *req) {
     TJSRsaSignReq *sr = req->data;
     mbedtls_pk_context pk;
-    mbedtls_ctr_drbg_context ctr_drbg;
-    mbedtls_entropy_context entropy;
     uint8_t hash[64]; /* Max SHA-512. */
 
     mbedtls_pk_init(&pk);
 
-    int ret = tjs__setup_rng(&ctr_drbg, &entropy);
-    if (ret != 0) {
-        goto cleanup;
-    }
-
-    ret = mbedtls_pk_parse_key(&pk,
-                               sr->privkey_der_ref.data,
-                               sr->privkey_der_ref.size,
-                               NULL,
-                               0,
-                               mbedtls_ctr_drbg_random,
-                               &ctr_drbg);
+    int ret =
+        mbedtls_pk_parse_key(&pk, sr->privkey_der_ref.data, sr->privkey_der_ref.size, NULL, 0, tjs__entropy_uv, NULL);
     if (ret != 0) {
         goto cleanup;
     }
@@ -2193,8 +2116,8 @@ static void tjs__rsa_sign_work_cb(uv_work_t *req) {
     if (sr->padding_mode == RSA_PADDING_PSS) {
         mbedtls_rsa_set_padding(rsa, MBEDTLS_RSA_PKCS_V21, md_type);
         ret = mbedtls_rsa_rsassa_pss_sign_ext(rsa,
-                                              mbedtls_ctr_drbg_random,
-                                              &ctr_drbg,
+                                              tjs__entropy_uv,
+                                              NULL,
                                               md_type,
                                               (unsigned int) hash_len,
                                               hash,
@@ -2203,8 +2126,8 @@ static void tjs__rsa_sign_work_cb(uv_work_t *req) {
     } else {
         mbedtls_rsa_set_padding(rsa, MBEDTLS_RSA_PKCS_V15, md_type);
         ret = mbedtls_rsa_rsassa_pkcs1_v15_sign(rsa,
-                                                mbedtls_ctr_drbg_random,
-                                                &ctr_drbg,
+                                                tjs__entropy_uv,
+                                                NULL,
                                                 md_type,
                                                 (unsigned int) hash_len,
                                                 hash,
@@ -2213,8 +2136,6 @@ static void tjs__rsa_sign_work_cb(uv_work_t *req) {
 
 cleanup:
     mbedtls_pk_free(&pk);
-    mbedtls_ctr_drbg_free(&ctr_drbg);
-    mbedtls_entropy_free(&entropy);
     sr->r = ret;
 }
 
@@ -2497,14 +2418,7 @@ static JSValue tjs_webcrypto_ec_parse_key(JSContext *ctx, JSValue this_val, int 
 
     int ret;
     if (is_private) {
-        mbedtls_ctr_drbg_context ctr_drbg;
-        mbedtls_entropy_context entropy;
-        ret = tjs__setup_rng(&ctr_drbg, &entropy);
-        if (ret == 0) {
-            ret = mbedtls_pk_parse_key(&pk, der, der_len, NULL, 0, mbedtls_ctr_drbg_random, &ctr_drbg);
-        }
-        mbedtls_ctr_drbg_free(&ctr_drbg);
-        mbedtls_entropy_free(&entropy);
+        ret = mbedtls_pk_parse_key(&pk, der, der_len, NULL, 0, tjs__entropy_uv, NULL);
     } else {
         ret = mbedtls_pk_parse_public_key(&pk, der, der_len);
     }
@@ -2636,19 +2550,12 @@ static JSValue tjs_webcrypto_ec_key_to_der(JSContext *ctx, JSValue this_val, int
         }
 
         /* Compute Q = d * G. */
-        mbedtls_ctr_drbg_context ctr_drbg;
-        mbedtls_entropy_context entropy;
-        ret = tjs__setup_rng(&ctr_drbg, &entropy);
-        if (ret == 0) {
-            ret = mbedtls_ecp_mul(&ec->MBEDTLS_PRIVATE(grp),
-                                  &ec->MBEDTLS_PRIVATE(Q),
-                                  &ec->MBEDTLS_PRIVATE(d),
-                                  &ec->MBEDTLS_PRIVATE(grp).G,
-                                  mbedtls_ctr_drbg_random,
-                                  &ctr_drbg);
-        }
-        mbedtls_ctr_drbg_free(&ctr_drbg);
-        mbedtls_entropy_free(&entropy);
+        ret = mbedtls_ecp_mul(&ec->MBEDTLS_PRIVATE(grp),
+                              &ec->MBEDTLS_PRIVATE(Q),
+                              &ec->MBEDTLS_PRIVATE(d),
+                              &ec->MBEDTLS_PRIVATE(grp).G,
+                              tjs__entropy_uv,
+                              NULL);
 
         if (ret != 0) {
             mbedtls_pk_free(&pk);
@@ -2711,14 +2618,7 @@ static JSValue tjs_webcrypto_rsa_parse_key(JSContext *ctx, JSValue this_val, int
 
     int ret;
     if (is_private) {
-        mbedtls_ctr_drbg_context ctr_drbg;
-        mbedtls_entropy_context entropy;
-        ret = tjs__setup_rng(&ctr_drbg, &entropy);
-        if (ret == 0) {
-            ret = mbedtls_pk_parse_key(&pk, der, der_len, NULL, 0, mbedtls_ctr_drbg_random, &ctr_drbg);
-        }
-        mbedtls_ctr_drbg_free(&ctr_drbg);
-        mbedtls_entropy_free(&entropy);
+        ret = mbedtls_pk_parse_key(&pk, der, der_len, NULL, 0, tjs__entropy_uv, NULL);
     } else {
         ret = mbedtls_pk_parse_public_key(&pk, der, der_len);
     }
@@ -2805,14 +2705,7 @@ static JSValue tjs_webcrypto_rsa_export_jwk(JSContext *ctx, JSValue this_val, in
 
     int ret;
     if (is_private) {
-        mbedtls_ctr_drbg_context ctr_drbg;
-        mbedtls_entropy_context entropy;
-        ret = tjs__setup_rng(&ctr_drbg, &entropy);
-        if (ret == 0) {
-            ret = mbedtls_pk_parse_key(&pk, der, der_len, NULL, 0, mbedtls_ctr_drbg_random, &ctr_drbg);
-        }
-        mbedtls_ctr_drbg_free(&ctr_drbg);
-        mbedtls_entropy_free(&entropy);
+        ret = mbedtls_pk_parse_key(&pk, der, der_len, NULL, 0, tjs__entropy_uv, NULL);
     } else {
         ret = mbedtls_pk_parse_public_key(&pk, der, der_len);
     }
@@ -3030,16 +2923,7 @@ static JSValue tjs_webcrypto_ec_get_public_key(JSContext *ctx, JSValue this_val,
         goto ec_pub_fail;
     }
 
-    {
-        mbedtls_ctr_drbg_context ctr_drbg;
-        mbedtls_entropy_context entropy;
-        ret = tjs__setup_rng(&ctr_drbg, &entropy);
-        if (ret == 0) {
-            ret = mbedtls_ecp_mul(&grp, &Q, &d, &grp.G, mbedtls_ctr_drbg_random, &ctr_drbg);
-        }
-        mbedtls_ctr_drbg_free(&ctr_drbg);
-        mbedtls_entropy_free(&entropy);
-    }
+    ret = mbedtls_ecp_mul(&grp, &Q, &d, &grp.G, tjs__entropy_uv, NULL);
 
     if (ret != 0) {
         goto ec_pub_fail;
@@ -3141,6 +3025,12 @@ static void tjs__ed25519_generate_key_work_cb(uv_work_t *req) {
     TJSEd25519GenerateKeyReq *er = req->data;
     uint8_t sk[64];
 
+    int ret = uv_random(NULL, NULL, er->seed, 32, 0, NULL);
+    if (ret != 0) {
+        er->r = ret;
+        return;
+    }
+
     crypto_sign_ed25519_seed_keypair(er->pubkey, sk, er->seed);
     memcpy(er->privkey, er->seed, 32);
     er->r = 0;
@@ -3191,24 +3081,6 @@ static JSValue tjs_webcrypto_ed25519_generate_key(JSContext *ctx, JSValue this_v
     er->callback = JS_DupValue(ctx, argv[0]);
     er->r = -1;
 
-    /* Generate random seed. */
-    mbedtls_ctr_drbg_context ctr_drbg;
-    mbedtls_entropy_context entropy;
-    int ret = tjs__setup_rng(&ctr_drbg, &entropy);
-    if (ret != 0) {
-        JS_FreeValue(ctx, er->callback);
-        js_free(ctx, er);
-        return JS_ThrowInternalError(ctx, "RNG setup failed");
-    }
-    ret = mbedtls_ctr_drbg_random(&ctr_drbg, er->seed, 32);
-    mbedtls_ctr_drbg_free(&ctr_drbg);
-    mbedtls_entropy_free(&entropy);
-    if (ret != 0) {
-        JS_FreeValue(ctx, er->callback);
-        js_free(ctx, er);
-        return JS_ThrowInternalError(ctx, "random generation failed");
-    }
-
     er->req.data = er;
 
     int r = uv_queue_work(tjs_get_loop(ctx),
@@ -3246,6 +3118,10 @@ static void tjs__ed25519_sign_work_cb(uv_work_t *req) {
 
     /* crypto_sign produces combined sig || msg; extract the 64-byte signature. */
     unsigned char *sm = tjs__malloc(64 + sr->message_ref.size);
+    if (!sm) {
+        sr->r = -1;
+        return;
+    }
     crypto_sign_ed25519(sm, &smlen, sr->message_ref.data, sr->message_ref.size, sk);
     memcpy(sr->signature, sm, 64);
     tjs__free(sm);
@@ -3348,6 +3224,12 @@ static void tjs__ed25519_verify_work_cb(uv_work_t *req) {
     /* Build combined sig || msg for crypto_sign_open. */
     unsigned char *sm = tjs__malloc(combined_len);
     unsigned char *tmp = tjs__malloc(combined_len);
+    if (!sm || !tmp) {
+        tjs__free(sm);
+        tjs__free(tmp);
+        vr->r = -1;
+        return;
+    }
     memcpy(sm, vr->sig_ref.data, 64);
     memcpy(sm + 64, vr->message_ref.data, vr->message_ref.size);
 
@@ -3480,21 +3362,8 @@ typedef struct {
 
 static void tjs__x25519_generate_key_work_cb(uv_work_t *req) {
     TJSX25519GenerateKeyReq *xr = req->data;
-    mbedtls_ctr_drbg_context ctr_drbg;
-    mbedtls_entropy_context entropy;
 
-    int ret = tjs__setup_rng(&ctr_drbg, &entropy);
-    if (ret != 0) {
-        xr->r = ret;
-        mbedtls_ctr_drbg_free(&ctr_drbg);
-        mbedtls_entropy_free(&entropy);
-        return;
-    }
-
-    ret = mbedtls_ctr_drbg_random(&ctr_drbg, xr->privkey, 32);
-    mbedtls_ctr_drbg_free(&ctr_drbg);
-    mbedtls_entropy_free(&entropy);
-
+    int ret = uv_random(NULL, NULL, xr->privkey, 32, 0, NULL);
     if (ret != 0) {
         xr->r = ret;
         return;
@@ -3681,10 +3550,21 @@ static JSValue tjs_webcrypto_aes_kw(JSContext *ctx, JSValue this_val, int argc, 
         return JS_EXCEPTION;
     }
 
+    int is_wrap = (operation == AES_KW_OP_WRAP);
+
+    if (data_len % 8 != 0) {
+        return JS_ThrowTypeError(ctx, "AES-KW input length must be a multiple of 8 bytes");
+    }
+    if (is_wrap && data_len < 16) {
+        return JS_ThrowTypeError(ctx, "AES-KW wrap input must be at least 16 bytes");
+    }
+    if (!is_wrap && data_len < 24) {
+        return JS_ThrowTypeError(ctx, "AES-KW unwrap input must be at least 24 bytes");
+    }
+
     mbedtls_nist_kw_context kw_ctx;
     mbedtls_nist_kw_init(&kw_ctx);
 
-    int is_wrap = (operation == AES_KW_OP_WRAP);
     int ret = mbedtls_nist_kw_setkey(&kw_ctx, MBEDTLS_CIPHER_ID_AES, key, (unsigned int) (key_len * 8), is_wrap);
     if (ret != 0) {
         mbedtls_nist_kw_free(&kw_ctx);
