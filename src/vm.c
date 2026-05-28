@@ -653,8 +653,31 @@ void tjs__execute_jobs(JSContext *ctx) {
      * (e.g. Promise.reject(x).catch(fn)) don't spuriously fire events. */
     TJSRuntime *qrt = TJS_GetRuntime(ctx);
     CHECK_NOT_NULL(qrt);
+
+    /* Snapshot the pending rejections into a local list before dispatching.
+     * Dispatching an 'unhandledrejection' event (tjs__dispatch_event below)
+     * re-enters JS, which can attach a handler to another still-pending
+     * promise and call tjs__pending_rejections_remove() — freeing a list
+     * entry mid-iteration. list_for_each_safe only protects against the
+     * CURRENT node being removed, not the saved `next` nor `pr` itself, so
+     * this was a heap-use-after-free on rejection-heavy pages (caught by
+     * ASan). Moving the entries to a local list and emptying the global one
+     * means re-entrant _remove operates on the now-empty global list and
+     * cannot touch our snapshot; rejections raised during dispatch land in
+     * the global list and are handled on the next drain. */
+    struct list_head pending;
+    init_list_head(&pending);
+    if (!list_empty(&qrt->pending_rejections)) {
+        struct list_head *src = &qrt->pending_rejections;
+        pending.next = src->next;
+        pending.prev = src->prev;
+        pending.next->prev = &pending;
+        pending.prev->next = &pending;
+        init_list_head(src);
+    }
+
     struct list_head *el, *el1;
-    list_for_each_safe(el, el1, &qrt->pending_rejections) {
+    list_for_each_safe(el, el1, &pending) {
         TJSPendingRejection *pr = list_entry(el, TJSPendingRejection, link);
 
         JSValue event_name = JS_NewString(ctx, "unhandledrejection");
@@ -685,15 +708,23 @@ void tjs__execute_jobs(JSContext *ctx) {
         JS_FreeValue(ctx, ret);
 
         if (should_abort) {
-            JSValue reason = pr->reason;
-            /* Free all pending rejections. */
+            /* Dup the reason so freeing the snapshot below (which frees
+             * pr->reason) leaves a live value for JS_Throw. */
+            JSValue reason = JS_DupValue(ctx, pr->reason);
+            /* Free the remaining snapshot entries, then any rejections that
+             * accumulated in the global list during dispatch. */
             struct list_head *el2, *el3;
+            list_for_each_safe(el2, el3, &pending) {
+                TJSPendingRejection *pr2 = list_entry(el2, TJSPendingRejection, link);
+                JS_FreeValue(ctx, pr2->promise);
+                JS_FreeValue(ctx, pr2->reason);
+                list_del(&pr2->link);
+                js_free(ctx, pr2);
+            }
             list_for_each_safe(el2, el3, &qrt->pending_rejections) {
                 TJSPendingRejection *pr2 = list_entry(el2, TJSPendingRejection, link);
                 JS_FreeValue(ctx, pr2->promise);
-                if (pr2 != pr) {
-                    JS_FreeValue(ctx, pr2->reason);
-                }
+                JS_FreeValue(ctx, pr2->reason);
                 list_del(&pr2->link);
                 js_free(ctx, pr2);
             }
