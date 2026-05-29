@@ -34,6 +34,45 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(_WIN32)
+/* MSVC has no <unistd.h> getopt. Minimal short-option getopt covering the
+ * syntax this tool parses ("ho:p:n:ms"): a letter optionally followed by ':'
+ * to require an argument. Not a full POSIX implementation. */
+static char *optarg = NULL;
+static int optind = 1;
+static int getopt(int argc, char **argv, const char *optstring) {
+    static int sp = 1;
+    if (optind >= argc || argv[optind][0] != '-' || argv[optind][1] == '\0')
+        return -1;
+    if (argv[optind][1] == '-' && argv[optind][2] == '\0') { /* "--" */
+        optind++;
+        return -1;
+    }
+    int c = argv[optind][sp];
+    const char *p = (c == ':') ? NULL : strchr(optstring, c);
+    if (p == NULL) {
+        if (argv[optind][++sp] == '\0') { optind++; sp = 1; }
+        return '?';
+    }
+    if (p[1] == ':') { /* requires an argument */
+        if (argv[optind][sp + 1] != '\0') {
+            optarg = &argv[optind][sp + 1];
+            optind++;
+        } else if (++optind < argc) {
+            optarg = argv[optind++];
+        } else {
+            sp = 1;
+            return '?';
+        }
+        sp = 1;
+    } else { /* no argument */
+        optarg = NULL;
+        if (argv[optind][++sp] == '\0') { optind++; sp = 1; }
+    }
+    return c;
+}
+#endif /* _WIN32 */
+
 
 /* BEGIN: copied over from quickjs-libc to avoid dependency. */
 
