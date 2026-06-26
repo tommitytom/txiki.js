@@ -161,6 +161,15 @@ endif()
 add_executable(tjsc EXCLUDE_FROM_ALL
     src/qjsc.c
 )
+if(WIN32)
+    # qjsc.c uses POSIX getopt/optarg/optind (no <unistd.h> on the MSVC CRT).
+    # Force-include a minimal getopt shim.
+    if(MSVC)
+        target_compile_options(tjsc PRIVATE "/FI${CMAKE_CURRENT_SOURCE_DIR}/src/getopt_win.h")
+    else()
+        target_compile_options(tjsc PRIVATE "-include" "${CMAKE_CURRENT_SOURCE_DIR}/src/getopt_win.h")
+    endif()
+endif()
 
 ###
 ### Dependencies
