@@ -312,7 +312,9 @@ static inline void tjs__normalize_pathsep(const char *name) {
 #if defined(_WIN32)
     char *p;
 
-    for (p = name; *p; p++) {
+    // Cast away const: this normalizes the separators in place (as it already
+    // did via p[0] below); the explicit cast silences C4090 on `p = name`.
+    for (p = (char *) name; *p; p++) {
         if (p[0] == TJS__PATHSEP_POSIX) {
             p[0] = TJS__PATHSEP;
         }

@@ -53,7 +53,9 @@ extern "C" {
 #endif
 #endif
 
+#ifndef ARRAY_SIZE // may already be defined by a consumer's headers → C4005
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#endif
 
 #ifndef countof
 #define countof(x) (sizeof(x) / sizeof((x)[0]))
@@ -98,8 +100,10 @@ struct AssertionInfo {
 #define PRETTY_FUNCTION_NAME ""
 #endif
 
+#ifndef STRINGIFY // may already be defined by a consumer's headers → C4005
 #define STRINGIFY_(x) #x
 #define STRINGIFY(x)  STRINGIFY_(x)
+#endif
 
 #define CHECK(expr)                                                                                                    \
     do {                                                                                                               \
