@@ -1,4 +1,4 @@
-const core = globalThis[Symbol.for('tjs.internal.core')];
+import core from 'tjs:internal/core';
 
 const engine = Object.create(null);
 
@@ -73,6 +73,13 @@ Object.defineProperty(engine, 'gc', {
             return gcState.threshold;
         },
     }
+});
+
+Object.defineProperty(engine, 'features', {
+    enumerable: true,
+    configurable: false,
+    writable: false,
+    value: Object.freeze(core.features)
 });
 
 Object.defineProperty(engine, 'versions', {

@@ -30,11 +30,13 @@
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
+#include <windows.h>
 #endif
 
 #ifdef NDEBUG
@@ -65,6 +67,7 @@ static void *tjs__mf_realloc(void *opaque, void *ptr, size_t size) {
     return tjs__realloc(ptr, size);
 }
 
+#ifdef TJS_HAVE_WASM
 /* WAMR allocator wrappers — WAMR uses unsigned int, not size_t. */
 
 static void *tjs__wamr_malloc(unsigned int size) {
@@ -74,6 +77,7 @@ static void *tjs__wamr_malloc(unsigned int size) {
 static void *tjs__wamr_realloc(void *ptr, unsigned int size) {
     return tjs__realloc(ptr, size);
 }
+#endif
 
 static const JSMallocFunctions tjs_mf = {
     .js_calloc = tjs__mf_calloc,
@@ -232,13 +236,17 @@ static void tjs__bootstrap_core(JSContext *ctx, JSValue ns) {
     tjs__mod_dns_init(ctx, ns);
     tjs__mod_engine_init(ctx, ns);
     tjs__mod_error_init(ctx, ns);
+#ifdef TJS_HAVE_FFI
     tjs__mod_ffi_init(ctx, ns);
+#endif
     tjs__mod_fs_init(ctx, ns);
     tjs__mod_fswatch_init(ctx, ns);
     tjs__mod_os_init(ctx, ns);
     tjs__mod_process_init(ctx, ns);
     tjs__mod_signals_init(ctx, ns);
+#ifdef TJS_HAVE_SQLITE
     tjs__mod_sqlite3_init(ctx, ns);
+#endif
     tjs__mod_streams_init(ctx, ns);
     tjs__mod_tls_init(ctx, ns);
     tjs__mod_sys_init(ctx, ns);
@@ -246,7 +254,9 @@ static void tjs__bootstrap_core(JSContext *ctx, JSValue ns) {
     tjs__mod_timers_init(ctx, ns);
     tjs__mod_udp_init(ctx, ns);
     tjs__mod_url_init(ctx, ns);
+#ifdef TJS_HAVE_WASM
     tjs__mod_wasm_init(ctx, ns);
+#endif
     tjs__mod_worker_init(ctx, ns);
     tjs__mod_hashing_init(ctx, ns);
     tjs__mod_httpclient_init(ctx, ns);
@@ -309,6 +319,8 @@ static JSValue tjs__dispatch_event(JSContext *ctx, JSValue *event) {
     return ret;
 }
 
+static void uv__maybe_idle(TJSRuntime *qrt);
+
 static void tjs__pending_rejections_add(TJSRuntime *qrt, JSContext *ctx, JSValue promise, JSValue reason) {
     TJSPendingRejection *pr = js_malloc(ctx, sizeof(*pr));
     if (!pr) {
@@ -317,6 +329,11 @@ static void tjs__pending_rejections_add(TJSRuntime *qrt, JSContext *ctx, JSValue
     pr->promise = JS_DupValue(ctx, promise);
     pr->reason = JS_DupValue(ctx, reason);
     list_add_tail(&pr->link, &qrt->pending_rejections);
+    /* The tracker can fire from inside a libuv callback (e.g. when an
+     * async finally completes during the close phase).  Make sure the loop
+     * runs at least one more iteration so the check phase can dispatch the
+     * 'unhandledrejection' event; otherwise the rejection would be lost. */
+    uv__maybe_idle(qrt);
 }
 
 static void tjs__pending_rejections_remove(TJSRuntime *qrt, JSContext *ctx, JSValue promise) {
@@ -449,14 +466,13 @@ TJSRuntime *TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions *options) {
 
     /* start bootstrap */
     JSValue global_obj = JS_GetGlobalObject(ctx);
-    JSValue core_sym = JS_NewSymbol(ctx, "tjs.internal.core", true);
-    JSAtom core_atom = JS_ValueToAtom(ctx, core_sym);
     JSValue core = JS_NewObjectProto(ctx, JS_NULL);
 
-    CHECK_EQ(JS_DefinePropertyValue(ctx, global_obj, core_atom, core, JS_PROP_C_W_E), true);
     CHECK_EQ(JS_DefinePropertyValueStr(ctx, core, "isWorker", JS_NewBool(ctx, is_worker), JS_PROP_C_W_E), true);
 
     qrt->builtins.import_map_resolver = JS_UNDEFINED;
+    qrt->builtins.internal_message_pipe = JS_UNDEFINED;
+    qrt->builtins.internal_core = core;
 
     tjs__bootstrap_core(ctx, core);
 
@@ -470,10 +486,9 @@ TJSRuntime *TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions *options) {
     CHECK_EQ(JS_IsUndefined(qrt->builtins.promise_event_ctor), 0);
 
     /* end bootstrap */
-    JS_FreeAtom(ctx, core_atom);
-    JS_FreeValue(ctx, core_sym);
     JS_FreeValue(ctx, global_obj);
 
+#ifdef TJS_HAVE_WASM
     /* WASM */
     RuntimeInitArgs wasm_init_args;
     memset(&wasm_init_args, 0, sizeof(wasm_init_args));
@@ -484,6 +499,7 @@ TJSRuntime *TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions *options) {
     CHECK_EQ(wasm_runtime_full_init(&wasm_init_args), true);
     qrt->wasm_ctx.initialized = true;
     qrt->wasm_ctx.stack_size = 512 * 1024;
+#endif
 
     /* Timers */
     qrt->timers.timers = NULL;
@@ -491,6 +507,9 @@ TJSRuntime *TJS_NewRuntimeInternal(bool is_worker, TJSRunOptions *options) {
 
     /* Pending rejection tracking */
     init_list_head(&qrt->pending_rejections);
+
+    /* libwebsockets initializtion */
+    tjs__lws_setup();
 
     return qrt;
 }
@@ -539,6 +558,10 @@ void TJS_FreeRuntime(TJSRuntime *qrt) {
     qrt->builtins.promise_event_ctor = JS_UNDEFINED;
     JS_FreeValue(qrt->ctx, qrt->builtins.import_map_resolver);
     qrt->builtins.import_map_resolver = JS_UNDEFINED;
+    JS_FreeValue(qrt->ctx, qrt->builtins.internal_core);
+    qrt->builtins.internal_core = JS_UNDEFINED;
+    JS_FreeValue(qrt->ctx, qrt->builtins.internal_message_pipe);
+    qrt->builtins.internal_message_pipe = JS_UNDEFINED;
     {
         struct list_head *el, *el1;
         list_for_each_safe(el, el1, &qrt->pending_rejections) {
@@ -552,11 +575,13 @@ void TJS_FreeRuntime(TJSRuntime *qrt) {
     JS_FreeContext(qrt->ctx);
     JS_FreeRuntime(qrt->rt);
 
+#ifdef TJS_HAVE_WASM
     /* Destroy WASM runtime. */
     if (qrt->wasm_ctx.initialized) {
         wasm_runtime_destroy();
         qrt->wasm_ctx.initialized = false;
     }
+#endif
 
     /* Cleanup loop. All handles should be closed. */
     int closed = 0;
@@ -579,6 +604,32 @@ void TJS_FreeRuntime(TJSRuntime *qrt) {
     tjs__free(qrt);
 }
 
+#ifdef _WIN32
+static void tjs__invalid_parameter_handler(const wchar_t *expression,
+                                           const wchar_t *function,
+                                           const wchar_t *file,
+                                           unsigned int line,
+                                           uintptr_t reserved) {
+    /* The default UCRT handler terminates the process (and may pop a Windows
+     * Error Reporting dialog) when a CRT function receives an invalid
+     * parameter. Override it with a no-op so the CRT function returns an error
+     * instead, matching what other CLI runtimes (e.g. Node.js) do. */
+    (void) expression;
+    (void) function;
+    (void) file;
+    (void) line;
+    (void) reserved;
+}
+
+static UINT tjs__prev_console_output_cp = 0;
+
+static void tjs__restore_console_output_cp(void) {
+    if (tjs__prev_console_output_cp != 0) {
+        SetConsoleOutputCP(tjs__prev_console_output_cp);
+    }
+}
+#endif
+
 void TJS_Initialize(int argc, char **argv) {
     CHECK_EQ(0, uv_replace_allocator(tjs__malloc, tjs__realloc, tjs__calloc, tjs__free));
 
@@ -591,6 +642,18 @@ void TJS_Initialize(int argc, char **argv) {
 #ifdef _WIN32
     _setmode(_fileno(stdout), _O_BINARY);
     _setmode(_fileno(stderr), _O_BINARY);
+
+    /* Make sure conmsole is set to UTF-8 so our output doesn't get garbled. */
+    tjs__prev_console_output_cp = GetConsoleOutputCP();
+    if (tjs__prev_console_output_cp != 0 && tjs__prev_console_output_cp != CP_UTF8) {
+        SetConsoleOutputCP(CP_UTF8);
+        atexit(tjs__restore_console_output_cp);
+    }
+
+    /* CLI tool: never block on GUI error dialogs. Suppress the WER crash dialog
+     * and the OS critical-error message box (e.g. device-not-ready). */
+    SetErrorMode(GetErrorMode() | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+    _set_invalid_parameter_handler(tjs__invalid_parameter_handler);
 #endif
 
 #ifdef SIGPIPE
@@ -611,7 +674,7 @@ static void uv__idle_cb(uv_idle_t *handle) {
 }
 
 static void uv__maybe_idle(TJSRuntime *qrt) {
-    if (JS_IsJobPending(qrt->rt)) {
+    if (JS_IsJobPending(qrt->rt) || !list_empty(&qrt->pending_rejections)) {
         CHECK_EQ(uv_idle_start(&qrt->jobs.idle, uv__idle_cb), 0);
     } else {
         CHECK_EQ(uv_idle_stop(&qrt->jobs.idle), 0);
@@ -720,7 +783,7 @@ static void uv__check_cb(uv_check_t *handle) {
 static bool tjs__fire_beforeunload(TJSRuntime *qrt) {
     static char code[] = "(function(){"
                          "  const e = new Event('beforeunload', { cancelable: true });"
-                         "  return !window.dispatchEvent(e);"
+                         "  return !globalThis.dispatchEvent(e);"
                          "})();";
 
     JSContext *ctx = qrt->ctx;
@@ -850,10 +913,10 @@ JSValue TJS_EvalModuleContent(JSContext *ctx,
         ret = JS_EvalFunction(ctx, ret);
     }
 
-    /* Emit window 'load' event. */
+    /* Emit 'load' event. */
     if (!JS_IsException(ret) && is_main) {
-        static char emit_window_load[] = "window.dispatchEvent(new Event('load'));";
-        JSValue ret1 = JS_Eval(ctx, emit_window_load, strlen(emit_window_load), "<global>", JS_EVAL_TYPE_GLOBAL);
+        static char emit_load[] = "globalThis.dispatchEvent(new Event('load'));";
+        JSValue ret1 = JS_Eval(ctx, emit_load, strlen(emit_load), "<global>", JS_EVAL_TYPE_GLOBAL);
         if (JS_IsException(ret1)) {
             tjs_dump_error(ctx);
         }

@@ -32,13 +32,17 @@
 #include <libwebsockets.h>
 #include <mbedtls/x509_crt.h>
 #include <quickjs.h>
+#ifdef TJS_HAVE_SQLITE
 #include <sqlite3.h>
+#endif
 #include <stdbool.h>
 #ifndef _WIN32
 #include <unistd.h>
 #endif
 #include <uv.h>
+#ifdef TJS_HAVE_WASM
 #include <wasm_export.h>
+#endif
 
 #ifndef STDIN_FILENO
 #define STDIN_FILENO 0
@@ -81,10 +85,12 @@ struct TJSRuntime {
     bool is_worker;
     bool freeing;
     bool draining_microtasks;
+#ifdef TJS_HAVE_WASM
     struct {
         bool initialized;
         uint32_t stack_size;
     } wasm_ctx;
+#endif
     struct {
         struct lws_context *ctx;
         struct lws_vhost *vh_direct;
@@ -113,6 +119,8 @@ struct TJSRuntime {
         JSValue promise_event_ctor;
         JSValue dispatch_event_func;
         JSValue import_map_resolver;
+        JSValue internal_core;
+        JSValue internal_message_pipe;
     } builtins;
     struct list_head pending_rejections;
 };
@@ -133,7 +141,9 @@ void tjs__decompressor_destroy(TJSDecompressor *d, JSRuntime *rt);
 void tjs__mod_os_init(JSContext *ctx, JSValue ns);
 void tjs__mod_process_init(JSContext *ctx, JSValue ns);
 void tjs__mod_signals_init(JSContext *ctx, JSValue ns);
+#ifdef TJS_HAVE_SQLITE
 void tjs__mod_sqlite3_init(JSContext *ctx, JSValue ns);
+#endif
 void tjs__mod_streams_init(JSContext *ctx, JSValue ns);
 void tjs__mod_tls_init(JSContext *ctx, JSValue ns);
 void tjs__mod_tls_cleanup(TJSRuntime *qrt);
@@ -141,7 +151,9 @@ void tjs__mod_sys_init(JSContext *ctx, JSValue ns);
 void tjs__mod_text_coding_init(JSContext *ctx, JSValue ns);
 void tjs__mod_timers_init(JSContext *ctx, JSValue ns);
 void tjs__mod_udp_init(JSContext *ctx, JSValue ns);
+#ifdef TJS_HAVE_WASM
 void tjs__mod_wasm_init(JSContext *ctx, JSValue ns);
+#endif
 void tjs__mod_worker_init(JSContext *ctx, JSValue ns);
 void tjs__webcrypto_init(JSContext *ctx, JSValue ns);
 void tjs__mod_ws_init(JSContext *ctx, JSValue ns);
@@ -176,8 +188,10 @@ void tjs__destroy_timers(TJSRuntime *qrt);
 void tjs__sab_free(void *opaque, void *ptr);
 void tjs__sab_dup(void *opaque, void *ptr);
 
+extern const lws_plugin_evlib_t tjs_lws_evlib;
+
 struct lws_context *tjs__lws_get_context(JSContext *ctx);
-void tjs__lws_init(TJSRuntime *qrt);
+void tjs__lws_setup(void);
 void tjs__lws_conn_ref(JSContext *ctx);
 void tjs__lws_conn_unref(JSContext *ctx);
 struct lws_vhost *tjs__lws_select_vhost(JSContext *ctx, const char *scheme, const char *hostname, int port);
